@@ -123,6 +123,44 @@ spec:
     - name: toystore
       port: 80
 
+---
+
+apiVersion: kuadrant.io/v1beta2
+kind: RateLimitPolicy
+metadata:
+  name: paying-customer-rate-limit
+  namespace: istio-system
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: paying-customer-gw
+  limits:
+    "high-priority":
+      rates:
+        - limit: 100
+          duration: 1
+          unit: second
+
+---
+
+apiVersion: kuadrant.io/v1beta2
+kind: RateLimitPolicy
+metadata:
+  name: free-tier-rate-limit
+  namespace: istio-system
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: free-tier-gw
+  limits:
+    "low-priority":
+      rates:
+        - limit: 10
+          duration: 1
+          unit: second
+
 EOF
 }
 
