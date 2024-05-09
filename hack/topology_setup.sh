@@ -142,6 +142,7 @@ spec:
           duration: 1
           unit: second
 
+
 ---
 
 apiVersion: kuadrant.io/v1beta2
@@ -161,6 +162,79 @@ spec:
           duration: 1
           unit: second
 
+---
+
+apiVersion: kuadrant.io/v1beta2
+kind: RateLimitPolicy
+metadata:
+  name: account-rlp
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: account-management-route
+  limits:
+    status-per-ip:
+      rates:
+      - limit: 10
+        duration: 5
+        unit: minute
+      counters:
+      - source.address
+
+---
+
+apiVersion: kuadrant.io/v1beta2
+kind: RateLimitPolicy
+metadata:
+  name: app.custom.domain.rlp
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: customer-domain-route
+  limits:
+    customer-domain-route-limits:
+    rates:
+    - limit: 50
+      duration: 1
+      unit: minute
+    - limit: 
+      duration: 1
+      unit: minute
+    - limit: 1000
+      duration: 1
+      unit: hour
+    - limit: 10000
+      duration: 1
+      unit: day
+    counters:
+    - source.address
+    - destination.service
+    
+---
+
+apiVersion: kuadrant.io/v1beta2
+kind: RateLimitPolicy
+metadata:
+  name: joe-bloggs-route-rlp
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: free-tier-gw
+  limits:
+    joe-bloggs-route-limits:
+    rates:
+    - limit: 2
+      duration: 10
+      unit: second
+    counters:
+    - request.host
+    when:
+    - selector: auth.identity.admin
+      operator: neq
+      value: "true"
 EOF
 }
 
