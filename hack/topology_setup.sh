@@ -1,12 +1,24 @@
 #!/bin/bash
 
 applyGateway(){
+
+kubectl -n kuadrant-system apply -f - <<EOF
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+spec: {}
+EOF
+
+kubectl -n default apply -f ../examples/toystore/toystore.yaml
+
     echo "Applying Gateway"
-    kubectl -n istio-system apply -f - <<EOF
+    kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
 metadata:
   name: paying-customer-gw
+  namespace: istio-system
   annotations:
     kuadrant.io/namespace: kuadrant-system
     networking.istio.io/service-type: ClusterIP
@@ -16,51 +28,44 @@ spec:
     - name: websites
       port: 80
       protocol: HTTP
-      hostname: '*.website'
+      hostname: '*.paying.website'
       allowedRoutes:
         namespaces:
           from: All
-    - name: apis
-      port: 80
-      protocol: HTTP
-      hostname: '*.io'
-      allowedRoutes:
-        namespaces:
-          from: All
+
 ---
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
 metadata:
   name: free-tier-gw
+  namespace: istio-system
+  annotations:
+    kuadrant.io/namespace: kuadrant-system
+    networking.istio.io/service-type: ClusterIP
 spec:
   gatewayClassName: istio
   listeners:
     - name: websites
       port: 80
       protocol: HTTP
-      hostname: '*.website'
+      hostname: '*.sa.com'
       allowedRoutes:
         namespaces:
           from: All
-    - name: apis
-      port: 80
-      protocol: HTTP
-      hostname: '*.io'
-      allowedRoutes:
-        namespaces:
-          from: All
+    
 ---
 
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: HTTPRoute
 metadata:
   name: customer-domain-route
+  namespace: default
 spec:
   parentRefs:
   - namespace: istio-system
     name: paying-customer-gw
   hostnames:
-  - '*.website'
+  - 'app.paying.website'
   rules:
   - matches:
     - method: GET
@@ -87,6 +92,7 @@ apiVersion: gateway.networking.k8s.io/v1beta1
 kind: HTTPRoute
 metadata:
   name: account-management-route
+  namespace: default
 spec:
   parentRefs:
   - namespace: istio-system
@@ -94,8 +100,8 @@ spec:
   - namespace: istio-system
     name: free-tier-gw
   hostnames:
-  - status.io
-  - status.local
+  - account.paying.website
+  - account.joe.bloggs.sa.com
   rules:
   - backendRefs:
     - name: toystore
@@ -107,10 +113,13 @@ apiVersion: gateway.networking.k8s.io/v1beta1
 kind: HTTPRoute
 metadata:
   name: joe-bloggs-route
+  namespace: default
 spec:
   parentRefs:
   - namespace: istio-system
     name: free-tier-gw
+  hostnames:
+  - "*.joe.bloggs.sa.com"
   rules:
   - matches:
     - path: 
@@ -138,8 +147,8 @@ spec:
   limits:
     "high-priority":
       rates:
-        - limit: 100
-          duration: 1
+        - limit: 10
+          duration: 10
           unit: second
 
 
@@ -158,8 +167,8 @@ spec:
   limits:
     "low-priority":
       rates:
-        - limit: 10
-          duration: 1
+        - limit: 3
+          duration: 10
           unit: second
 
 ---
@@ -168,6 +177,7 @@ apiVersion: kuadrant.io/v1beta2
 kind: RateLimitPolicy
 metadata:
   name: account-rlp
+  namespace: default
 spec:
   targetRef:
     group: gateway.networking.k8s.io
@@ -176,65 +186,71 @@ spec:
   limits:
     status-per-ip:
       rates:
-      - limit: 10
-        duration: 5
-        unit: minute
-      counters:
-      - source.address
+      - limit: 6
+        duration: 10
+        unit: second
+    
 
 ---
 
 apiVersion: kuadrant.io/v1beta2
 kind: RateLimitPolicy
 metadata:
-  name: app.custom.domain.rlp
+  name: paying-business-rlp
+  namespace: istio-system
 spec:
   targetRef:
     group: gateway.networking.k8s.io
-    kind: HTTPRoute
-    name: customer-domain-route
+    kind: Gateway
+    name: paying-customer-gw
   limits:
     customer-domain-route-limits:
-    rates:
-    - limit: 50
-      duration: 1
-      unit: minute
-    - limit: 
-      duration: 1
-      unit: minute
-    - limit: 1000
-      duration: 1
-      unit: hour
-    - limit: 10000
-      duration: 1
-      unit: day
-    counters:
-    - source.address
-    - destination.service
+      rates:
+      - limit: 5
+        duration: 10
+        unit: second
+    
     
 ---
 
 apiVersion: kuadrant.io/v1beta2
 kind: RateLimitPolicy
 metadata:
-  name: joe-bloggs-route-rlp
+  name: infra-rlp
+  namespace: istio-system
 spec:
   targetRef:
     group: gateway.networking.k8s.io
     kind: Gateway
     name: free-tier-gw
   limits:
-    joe-bloggs-route-limits:
-    rates:
-    - limit: 2
-      duration: 10
-      unit: second
-    counters:
-    - request.host
-    when:
-    - selector: auth.identity.admin
-      operator: neq
-      value: "true"
+    "high-limit":
+      rates:
+      - limit: 5
+        duration: 1
+        unit: second
+
+---
+
+apiVersion: kuadrant.io/v1beta2
+kind: RateLimitPolicy
+metadata:
+  name: free-tier-business-rlp
+  namespace: default
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: joe-bloggs-route
+  limits:
+      "low-limit":
+        rates:
+        - limit: 2
+          duration: 10
+          unit: second
+
+---
+
 EOF
 }
 
