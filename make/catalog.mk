@@ -12,6 +12,8 @@ $(CATALOG_DOCKERFILE): $(OPM)
 	cd $(PROJECT_PATH)/catalog && $(OPM) generate dockerfile kuadrant-operator-catalog
 catalog-dockerfile: $(CATALOG_DOCKERFILE) ## Generate catalog dockerfile.
 
+CHANNELS ?= preview
+
 $(CATALOG_FILE): $(OPM) $(YQ)
 	@echo "************************************************************"
 	@echo Build kuadrant operator catalog
@@ -22,6 +24,7 @@ $(CATALOG_FILE): $(OPM) $(YQ)
 	@echo AUTHORINO_OPERATOR_BUNDLE_IMG  = $(AUTHORINO_OPERATOR_BUNDLE_IMG)
 	@echo DNS_OPERATOR_BUNDLE_IMG  		 = $(DNS_OPERATOR_BUNDLE_IMG)
 	@echo CHANNELS  					 = $(CHANNELS)
+	@echo CATALOG_FILE                   = $@
 	@echo "************************************************************"
 	@echo
 	@echo Please check this matches your expectations and override variables if needed.
@@ -52,3 +55,12 @@ catalog-build: ## Build a catalog image.
 .PHONY: catalog-push
 catalog-push: ## Push a catalog image.
 	$(MAKE) docker-push IMG=$(CATALOG_IMG)
+
+.PHONY: deploy-catalog
+deploy-catalog: $(KUSTOMIZE) $(YQ) ## Deploy operator to the K8s cluster specified in ~/.kube/config using OLM catalog image.
+	V="$(CATALOG_IMG)" $(YQ) eval '.spec.image = strenv(V)' -i config/deploy/olm/catalogsource.yaml
+	$(KUSTOMIZE) build config/deploy/olm | kubectl apply -f -
+
+.PHONY: undeploy-catalog
+undeploy-catalog: $(KUSTOMIZE) ## Undeploy controller from the K8s cluster specified in ~/.kube/config using OLM catalog image.
+	$(KUSTOMIZE) build config/deploy/olm | kubectl delete -f -

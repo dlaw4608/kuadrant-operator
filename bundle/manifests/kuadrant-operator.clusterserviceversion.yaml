@@ -106,7 +106,11 @@ metadata:
     capabilities: Basic Install
     categories: Integration & Delivery
     containerImage: quay.io/kuadrant/kuadrant-operator:latest
+<<<<<<< HEAD
     createdAt: "2024-04-15T13:13:45Z"
+=======
+    createdAt: "2024-05-30T13:48:45Z"
+>>>>>>> d2e301b29fbff0b5b39edc487cf0e4d6a763b95e
     operators.operatorframework.io/builder: operator-sdk-v1.32.0
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v3
     repository: https://github.com/Kuadrant/kuadrant-operator
@@ -263,6 +267,14 @@ spec:
           - update
           - watch
         - apiGroups:
+          - ""
+          resources:
+          - namespaces
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
           - extensions.istio.io
           resources:
           - wasmplugins
@@ -311,6 +323,14 @@ spec:
           - update
           - watch
         - apiGroups:
+          - gateway.networking.k8s.io
+          resources:
+          - httproutes/status
+          verbs:
+          - get
+          - patch
+          - update
+        - apiGroups:
           - install.istio.io
           resources:
           - istiooperators
@@ -347,24 +367,6 @@ spec:
           - get
           - patch
           - update
-        - apiGroups:
-          - kuadrant.io
-          resources:
-          - dnshealthcheckprobes
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - kuadrant.io
-          resources:
-          - dnshealthcheckprobes/status
-          verbs:
-          - get
         - apiGroups:
           - kuadrant.io
           resources:
@@ -699,7 +701,7 @@ spec:
   - email: didier@redhat.com
     name: Didier Di Cesare
   maturity: alpha
-  minKubeVersion: 1.8.0
+  minKubeVersion: 1.19.0
   provider:
     name: Red Hat
     url: https://github.com/Kuadrant/kuadrant-operator

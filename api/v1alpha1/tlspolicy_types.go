@@ -25,7 +25,9 @@ import (
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayapiv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
+	kuadrantgatewayapi "github.com/kuadrant/kuadrant-operator/pkg/library/gatewayapi"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/kuadrant"
+	"github.com/kuadrant/kuadrant-operator/pkg/library/utils"
 )
 
 const (
@@ -35,8 +37,9 @@ const (
 
 // TLSPolicySpec defines the desired state of TLSPolicy
 type TLSPolicySpec struct {
-	// +kubebuilder:validation:Required
-	// +required
+	// TargetRef identifies an API object to apply policy to.
+	// +kubebuilder:validation:XValidation:rule="self.group == 'gateway.networking.k8s.io'",message="Invalid targetRef.group. The only supported value is 'gateway.networking.k8s.io'"
+	// +kubebuilder:validation:XValidation:rule="self.kind == 'Gateway'",message="Invalid targetRef.kind. The only supported values are 'Gateway'"
 	TargetRef gatewayapiv1alpha2.PolicyTargetReference `json:"targetRef"`
 
 	CertificateSpec `json:",inline"`
@@ -116,13 +119,18 @@ type TLSPolicyStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
+func (s *TLSPolicyStatus) GetConditions() []metav1.Condition {
+	return s.Conditions
+}
+
 var _ kuadrant.Policy = &TLSPolicy{}
 var _ kuadrant.Referrer = &TLSPolicy{}
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:metadata:labels="gateway.networking.k8s.io/policy=direct"
-// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.conditions[0].reason`,description="TLSPolicy Status",priority=2
+// +kubebuilder:printcolumn:name="Accepted",type=string,JSONPath=`.status.conditions[?(@.type=="Accepted")].status`,description="TLSPolicy Accepted",priority=2
+// +kubebuilder:printcolumn:name="Enforced",type=string,JSONPath=`.status.conditions[?(@.type=="Enforced")].status`,description="TLSPolicy Enforced",priority=2
 // +kubebuilder:printcolumn:name="TargetRefKind",type="string",JSONPath=".spec.targetRef.kind",description="Type of the referenced Gateway API resource",priority=2
 // +kubebuilder:printcolumn:name="TargetRefName",type="string",JSONPath=".spec.targetRef.name",description="Name of the referenced Gateway API resource",priority=2
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
@@ -138,6 +146,10 @@ type TLSPolicy struct {
 
 func (p *TLSPolicy) Kind() string { return p.TypeMeta.Kind }
 
+func (p *TLSPolicy) PolicyClass() kuadrantgatewayapi.PolicyClass {
+	return kuadrantgatewayapi.DirectPolicy
+}
+
 func (p *TLSPolicy) GetWrappedNamespace() gatewayapiv1.Namespace {
 	return gatewayapiv1.Namespace(p.Namespace)
 }
@@ -148,6 +160,10 @@ func (p *TLSPolicy) GetRulesHostnames() []string {
 
 func (p *TLSPolicy) GetTargetRef() gatewayapiv1alpha2.PolicyTargetReference {
 	return p.Spec.TargetRef
+}
+
+func (p *TLSPolicy) GetStatus() kuadrantgatewayapi.PolicyStatus {
+	return &p.Status
 }
 
 func (p *TLSPolicy) BackReferenceAnnotationName() string {
@@ -183,6 +199,12 @@ type TLSPolicyList struct {
 	Items           []TLSPolicy `json:"items"`
 }
 
+func (l *TLSPolicyList) GetItems() []kuadrant.Policy {
+	return utils.Map(l.Items, func(item TLSPolicy) kuadrant.Policy {
+		return &item
+	})
+}
+
 func init() {
 	SchemeBuilder.Register(&TLSPolicy{}, &TLSPolicyList{})
 }
@@ -191,6 +213,10 @@ func init() {
 
 func NewTLSPolicy(policyName, ns string) *TLSPolicy {
 	return &TLSPolicy{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "TLSPolicy",
+			APIVersion: GroupVersion.String(),
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      policyName,
 			Namespace: ns,

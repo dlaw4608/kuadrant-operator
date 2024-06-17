@@ -18,13 +18,9 @@ package controllers
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"reflect"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -32,20 +28,17 @@ import (
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayapiv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
 	kuadrantdnsv1alpha1 "github.com/kuadrant/dns-operator/api/v1alpha1"
 
 	"github.com/kuadrant/kuadrant-operator/api/v1alpha1"
+	kuadrantgatewayapi "github.com/kuadrant/kuadrant-operator/pkg/library/gatewayapi"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/kuadrant"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/mappers"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/reconcilers"
 )
 
-const (
-	DNSPolicyFinalizer        = "kuadrant.io/dns-policy"
-	DNSPolicyAffected  string = "kuadrant.io/DNSPolicyAffected"
-)
+const DNSPolicyFinalizer = "kuadrant.io/dns-policy"
 
 type DNSPolicyRefsConfig struct{}
 
@@ -56,15 +49,11 @@ type DNSPolicyReconciler struct {
 	dnsHelper           dnsHelper
 }
 
+//+kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
 //+kubebuilder:rbac:groups=kuadrant.io,resources=dnspolicies,verbs=get;list;watch;update;patch;delete
 //+kubebuilder:rbac:groups=kuadrant.io,resources=dnspolicies/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=kuadrant.io,resources=dnspolicies/finalizers,verbs=update
-//+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch;update;patch
-//+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways/finalizers,verbs=update
 
-//+kubebuilder:rbac:groups=kuadrant.io,resources=dnshealthcheckprobes,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=kuadrant.io,resources=dnshealthcheckprobes/status,verbs=get
 //+kubebuilder:rbac:groups=kuadrant.io,resources=dnsrecords,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=kuadrant.io,resources=dnsrecords/status,verbs=get
 
@@ -137,15 +126,11 @@ func (r *DNSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 func (r *DNSPolicyReconciler) reconcileResources(ctx context.Context, dnsPolicy *v1alpha1.DNSPolicy, targetNetworkObject client.Object) error {
-	gatewayCondition := BuildPolicyAffectedCondition(DNSPolicyAffected, dnsPolicy, targetNetworkObject, gatewayapiv1alpha2.PolicyReasonAccepted, nil)
-
 	// validate
 	err := dnsPolicy.Validate()
 	if err != nil {
 		return err
 	}
-
-	dnsPolicy.Default()
 
 	// reconcile based on gateway diffs
 	gatewayDiffObj, err := reconcilers.ComputeGatewayDiffs(ctx, r.Client(), dnsPolicy, targetNetworkObject)
@@ -154,35 +139,17 @@ func (r *DNSPolicyReconciler) reconcileResources(ctx context.Context, dnsPolicy 
 	}
 
 	if err = r.reconcileDNSRecords(ctx, dnsPolicy, gatewayDiffObj); err != nil {
-		gatewayCondition = BuildPolicyAffectedCondition(DNSPolicyAffected, dnsPolicy, targetNetworkObject, gatewayapiv1alpha2.PolicyReasonInvalid, err)
-		updateErr := r.updateGatewayCondition(ctx, gatewayCondition, gatewayDiffObj)
-		return errors.Join(fmt.Errorf("reconcile DNSRecords error %w", err), updateErr)
-	}
-
-	if err = r.reconcileHealthCheckProbes(ctx, dnsPolicy, gatewayDiffObj); err != nil {
-		gatewayCondition = BuildPolicyAffectedCondition(DNSPolicyAffected, dnsPolicy, targetNetworkObject, gatewayapiv1alpha2.PolicyReasonInvalid, err)
-		updateErr := r.updateGatewayCondition(ctx, gatewayCondition, gatewayDiffObj)
-		return errors.Join(fmt.Errorf("reconcile HealthChecks error %w", err), updateErr)
+		return fmt.Errorf("reconcile DNSRecords error %w", err)
 	}
 
 	// set direct back ref - i.e. claim the target network object as taken asap
 	if err = r.TargetRefReconciler.ReconcileTargetBackReference(ctx, dnsPolicy, targetNetworkObject, dnsPolicy.DirectReferenceAnnotationName()); err != nil {
-		gatewayCondition = BuildPolicyAffectedCondition(DNSPolicyAffected, dnsPolicy, targetNetworkObject, gatewayapiv1alpha2.PolicyReasonConflicted, err)
-		updateErr := r.updateGatewayCondition(ctx, gatewayCondition, gatewayDiffObj)
-		return errors.Join(fmt.Errorf("reconcile TargetBackReference error %w", err), updateErr)
+		return fmt.Errorf("reconcile TargetBackReference error %w", err)
 	}
 
 	// set annotation of policies affecting the gateway
 	if err := r.TargetRefReconciler.ReconcileGatewayPolicyReferences(ctx, dnsPolicy, gatewayDiffObj); err != nil {
-		gatewayCondition = BuildPolicyAffectedCondition(DNSPolicyAffected, dnsPolicy, targetNetworkObject, gatewayapiv1alpha2.PolicyConditionReason(PolicyReasonUnknown), err)
-		updateErr := r.updateGatewayCondition(ctx, gatewayCondition, gatewayDiffObj)
-		return errors.Join(fmt.Errorf("ReconcileGatewayPolicyReferences error %w", err), updateErr)
-	}
-
-	// set gateway policy affected condition status - should be the last step, only when all the reconciliation steps succeed
-	updateErr := r.updateGatewayCondition(ctx, gatewayCondition, gatewayDiffObj)
-	if updateErr != nil {
-		return fmt.Errorf("failed to update gateway conditions %w ", updateErr)
+		return fmt.Errorf("ReconcileGatewayPolicyReferences error %w", err)
 	}
 
 	return nil
@@ -191,10 +158,6 @@ func (r *DNSPolicyReconciler) reconcileResources(ctx context.Context, dnsPolicy 
 func (r *DNSPolicyReconciler) deleteResources(ctx context.Context, dnsPolicy *v1alpha1.DNSPolicy, targetNetworkObject client.Object) error {
 	// delete based on gateway diffs
 	if err := r.deleteDNSRecords(ctx, dnsPolicy); err != nil {
-		return err
-	}
-
-	if err := r.deleteHealthCheckProbes(ctx, dnsPolicy); err != nil {
 		return err
 	}
 
@@ -211,45 +174,20 @@ func (r *DNSPolicyReconciler) deleteResources(ctx context.Context, dnsPolicy *v1
 	}
 
 	// update annotation of policies affecting the gateway
-	if err := r.TargetRefReconciler.ReconcileGatewayPolicyReferences(ctx, dnsPolicy, gatewayDiffObj); err != nil {
-		return err
-	}
-
-	// remove gateway policy affected condition status
-	return r.updateGatewayCondition(ctx, metav1.Condition{Type: DNSPolicyAffected}, gatewayDiffObj)
-}
-
-func (r *DNSPolicyReconciler) updateGatewayCondition(ctx context.Context, condition metav1.Condition, gatewayDiff *reconcilers.GatewayDiffs) error {
-	// update condition if needed
-	gatewayDiffs := append(gatewayDiff.GatewaysWithValidPolicyRef, gatewayDiff.GatewaysMissingPolicyRef...)
-	for i, gw := range gatewayDiffs {
-		previous := gw.DeepCopy()
-		meta.SetStatusCondition(&gatewayDiffs[i].Status.Conditions, condition)
-		if !reflect.DeepEqual(previous.Status.Conditions, gw.Status.Conditions) {
-			if err := r.Client().Status().Update(ctx, gw.Gateway); err != nil {
-				return err
-			}
-		}
-	}
-
-	// remove condition from gateway that is no longer referenced
-	gatewayDiffs = gatewayDiff.GatewaysWithInvalidPolicyRef
-	for i, gw := range gatewayDiff.GatewaysWithInvalidPolicyRef {
-		previous := gw.DeepCopy()
-		meta.RemoveStatusCondition(&gatewayDiffs[i].Status.Conditions, condition.Type)
-		if !reflect.DeepEqual(previous.Status.Conditions, gw.Status.Conditions) {
-			if err := r.Client().Status().Update(ctx, gw.Gateway); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
+	return r.TargetRefReconciler.ReconcileGatewayPolicyReferences(ctx, dnsPolicy, gatewayDiffObj)
 }
 
 func (r *DNSPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	ok, err := kuadrantgatewayapi.IsGatewayAPIInstalled(mgr.GetRESTMapper())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		r.Logger().Info("DNSPolicy controller disabled. GatewayAPI was not found")
+		return nil
+	}
+
 	gatewayEventMapper := mappers.NewGatewayEventMapper(mappers.WithLogger(r.Logger().WithName("gatewayEventMapper")))
-	dnsHealthCheckProbeEventMapper := NewDNSHealthCheckProbeEventMapper(mappers.WithLogger(r.Logger().WithName("dnsHealthCheckProbeEventMapper")))
 
 	r.dnsHelper = dnsHelper{Client: r.Client()}
 	ctrlr := ctrl.NewControllerManagedBy(mgr).
@@ -259,12 +197,6 @@ func (r *DNSPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&gatewayapiv1.Gateway{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
 				return gatewayEventMapper.MapToPolicy(object, &v1alpha1.DNSPolicy{})
-			}),
-		).
-		Watches(
-			&kuadrantdnsv1alpha1.DNSHealthCheckProbe{},
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
-				return dnsHealthCheckProbeEventMapper.MapToPolicy(object, &v1alpha1.DNSPolicy{})
 			}),
 		)
 	return ctrlr.Complete(r)

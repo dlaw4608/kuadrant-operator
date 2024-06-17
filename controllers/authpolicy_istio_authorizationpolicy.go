@@ -89,13 +89,13 @@ func (r *AuthPolicyReconciler) istioAuthorizationPolicy(ctx context.Context, ap 
 
 	iap := &istio.AuthorizationPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      istioAuthorizationPolicyName(gateway.Name, ap.GetTargetRef()),
+			Name:      IstioAuthorizationPolicyName(gateway.Name, ap.GetTargetRef()),
 			Namespace: gateway.Namespace,
 			Labels:    istioAuthorizationPolicyLabels(client.ObjectKeyFromObject(gateway), client.ObjectKeyFromObject(ap)),
 		},
 		Spec: istiosecurity.AuthorizationPolicy{
-			Action:   istiosecurity.AuthorizationPolicy_CUSTOM,
-			Selector: kuadrantistioutils.WorkloadSelectorFromGateway(ctx, r.Client(), gateway),
+			Action:    istiosecurity.AuthorizationPolicy_CUSTOM,
+			TargetRef: kuadrantistioutils.PolicyTargetRefFromGateway(gateway),
 			ActionDetail: &istiosecurity.AuthorizationPolicy_Provider{
 				Provider: &istiosecurity.AuthorizationPolicy_ExtensionProvider{
 					Name: KuadrantExtAuthProviderName,
@@ -124,7 +124,7 @@ func (r *AuthPolicyReconciler) istioAuthorizationPolicy(ctx context.Context, ap 
 		// fake a single httproute with all rules from all httproutes accepted by the gateway,
 		// that do not have an authpolicy of its own, so we can generate wasm rules for those cases
 		rules := make([]gatewayapiv1.HTTPRouteRule, 0)
-		routes := r.TargetRefReconciler.FetchAcceptedGatewayHTTPRoutes(ctx, ap.TargetKey())
+		routes := r.TargetRefReconciler.FetchAcceptedGatewayHTTPRoutes(ctx, obj)
 		for idx := range routes {
 			route := routes[idx]
 			// skip routes that have an authpolicy of its own
@@ -169,8 +169,8 @@ func (r *AuthPolicyReconciler) istioAuthorizationPolicy(ctx context.Context, ap 
 	return iap, nil
 }
 
-// istioAuthorizationPolicyName generates the name of an AuthorizationPolicy.
-func istioAuthorizationPolicyName(gwName string, targetRef gatewayapiv1alpha2.PolicyTargetReference) string {
+// IstioAuthorizationPolicyName generates the name of an AuthorizationPolicy.
+func IstioAuthorizationPolicyName(gwName string, targetRef gatewayapiv1alpha2.PolicyTargetReference) string {
 	switch targetRef.Kind {
 	case "Gateway":
 		return fmt.Sprintf("on-%s", gwName) // Without this, IAP will be named: on-<gw.Name>-using-<gw.Name>;

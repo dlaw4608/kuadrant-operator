@@ -18,15 +18,14 @@ package v1alpha1
 
 import (
 	"fmt"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayapiv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
-	kuadrantdnsv1alpha1 "github.com/kuadrant/dns-operator/api/v1alpha1"
-
+	kuadrantgatewayapi "github.com/kuadrant/kuadrant-operator/pkg/library/gatewayapi"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/kuadrant"
+	"github.com/kuadrant/kuadrant-operator/pkg/library/utils"
 )
 
 type RoutingStrategy string
@@ -44,18 +43,19 @@ const (
 )
 
 // DNSPolicySpec defines the desired state of DNSPolicy
+// +kubebuilder:validation:XValidation:rule="!(self.routingStrategy == 'loadbalanced' && !has(self.loadBalancing))",message="spec.loadBalancing is a required field when spec.routingStrategy == 'loadbalanced'"
 type DNSPolicySpec struct {
-	// +kubebuilder:validation:Required
-	// +required
+	// TargetRef identifies an API object to apply policy to.
+	// +kubebuilder:validation:XValidation:rule="self.group == 'gateway.networking.k8s.io'",message="Invalid targetRef.group. The only supported value is 'gateway.networking.k8s.io'"
+	// +kubebuilder:validation:XValidation:rule="self.kind == 'Gateway'",message="Invalid targetRef.kind. The only supported values are 'Gateway'"
 	TargetRef gatewayapiv1alpha2.PolicyTargetReference `json:"targetRef"`
 
 	// +optional
 	HealthCheck *HealthCheckSpec `json:"healthCheck,omitempty"`
 
 	// +optional
-	LoadBalancing *LoadBalancingSpec `json:"loadBalancing"`
+	LoadBalancing *LoadBalancingSpec `json:"loadBalancing,omitempty"`
 
-	// +required
 	// +kubebuilder:validation:Enum=simple;loadbalanced
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="RoutingStrategy is immutable"
 	// +kubebuilder:default=loadbalanced
@@ -63,21 +63,20 @@ type DNSPolicySpec struct {
 }
 
 type LoadBalancingSpec struct {
-	// +optional
-	Weighted *LoadBalancingWeighted `json:"weighted,omitempty"`
-	// +optional
-	Geo *LoadBalancingGeo `json:"geo,omitempty"`
+	Weighted LoadBalancingWeighted `json:"weighted"`
+
+	Geo LoadBalancingGeo `json:"geo"`
 }
 
 // +kubebuilder:validation:Minimum=0
 type Weight int
 
 type CustomWeight struct {
-	// Label selector used by MGC to match resource storing custom weight attribute values e.g. kuadrant.io/lb-attribute-custom-weight: AWS
-	// +required
+	// Label selector to match resource storing custom weight attribute values e.g. kuadrant.io/lb-attribute-custom-weight: AWS.
 	Selector *metav1.LabelSelector `json:"selector"`
-	// +required
-	Weight Weight `json:"weight,omitempty"`
+
+	// The weight value to apply when the selector matches.
+	Weight Weight `json:"weight"`
 }
 
 type LoadBalancingWeighted struct {
@@ -86,8 +85,9 @@ type LoadBalancingWeighted struct {
 	// The maximum value accepted is determined by the target dns provider, please refer to the appropriate docs below.
 	//
 	// Route53: https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-weighted.html
-	// +kubebuilder:default=120
-	DefaultWeight Weight `json:"defaultWeight,omitempty"`
+	DefaultWeight Weight `json:"defaultWeight"`
+
+	// custom list of custom weight selectors.
 	// +optional
 	Custom []*CustomWeight `json:"custom,omitempty"`
 }
@@ -108,8 +108,9 @@ type LoadBalancingGeo struct {
 	// The values accepted are determined by the target dns provider, please refer to the appropriate docs below.
 	//
 	// Route53: https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-values-geo.html
-	// +required
-	DefaultGeo string `json:"defaultGeo,omitempty"`
+	// Google: https://cloud.google.com/compute/docs/regions-zones
+	// +kubebuilder:validation:MinLength=2
+	DefaultGeo string `json:"defaultGeo"`
 }
 
 // DNSPolicyStatus defines the observed state of DNSPolicy
@@ -127,7 +128,15 @@ type DNSPolicyStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// +optional
 	HealthCheck *HealthCheckStatus `json:"healthCheck,omitempty"`
+
+	// +optional
+	RecordConditions map[string][]metav1.Condition `json:"recordConditions,omitempty"`
+}
+
+func (s *DNSPolicyStatus) GetConditions() []metav1.Condition {
+	return s.Conditions
 }
 
 var _ kuadrant.Policy = &DNSPolicy{}
@@ -136,7 +145,8 @@ var _ kuadrant.Referrer = &DNSPolicy{}
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:metadata:labels="gateway.networking.k8s.io/policy=direct"
-// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.conditions[0].reason`,description="DNSPolicy Status",priority=2
+// +kubebuilder:printcolumn:name="Accepted",type=string,JSONPath=`.status.conditions[?(@.type=="Accepted")].status`,description="DNSPolicy Accepted",priority=2
+// +kubebuilder:printcolumn:name="Enforced",type=string,JSONPath=`.status.conditions[?(@.type=="Enforced")].status`,description="DNSPolicy Enforced",priority=2
 // +kubebuilder:printcolumn:name="TargetRefKind",type="string",JSONPath=".spec.targetRef.kind",description="Type of the referenced Gateway API resource",priority=2
 // +kubebuilder:printcolumn:name="TargetRefName",type="string",JSONPath=".spec.targetRef.name",description="Name of the referenced Gateway API resource",priority=2
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
@@ -162,7 +172,15 @@ func (p *DNSPolicy) GetTargetRef() gatewayapiv1alpha2.PolicyTargetReference {
 	return p.Spec.TargetRef
 }
 
+func (p *DNSPolicy) GetStatus() kuadrantgatewayapi.PolicyStatus {
+	return &p.Status
+}
+
 func (p *DNSPolicy) Kind() string { return p.TypeMeta.Kind }
+
+func (p *DNSPolicy) PolicyClass() kuadrantgatewayapi.PolicyClass {
+	return kuadrantgatewayapi.DirectPolicy
+}
 
 func (p *DNSPolicy) BackReferenceAnnotationName() string {
 	return DNSPolicyBackReferenceAnnotationName
@@ -187,19 +205,7 @@ func (p *DNSPolicy) Validate() error {
 		return fmt.Errorf("invalid targetRef.Namespace %s. Currently only supporting references to the same namespace", *p.Spec.TargetRef.Namespace)
 	}
 
-	if p.Spec.HealthCheck != nil {
-		return p.Spec.HealthCheck.Validate()
-	}
-
 	return nil
-}
-
-// Default sets default values for the fields in the resource. Compatible with
-// the defaulting interface used by webhooks
-func (p *DNSPolicy) Default() {
-	if p.Spec.HealthCheck != nil {
-		p.Spec.HealthCheck.Default()
-	}
 }
 
 //+kubebuilder:object:root=true
@@ -211,54 +217,34 @@ type DNSPolicyList struct {
 	Items           []DNSPolicy `json:"items"`
 }
 
+func (l *DNSPolicyList) GetItems() []kuadrant.Policy {
+	return utils.Map(l.Items, func(item DNSPolicy) kuadrant.Policy {
+		return &item
+	})
+}
+
 // HealthCheckSpec configures health checks in the DNS provider.
 // By default, this health check will be applied to each unique DNS A Record for
 // the listeners assigned to the target gateway
 type HealthCheckSpec struct {
-	Endpoint                  string                                    `json:"endpoint,omitempty"`
-	Port                      *int                                      `json:"port,omitempty"`
-	Protocol                  *kuadrantdnsv1alpha1.HealthProtocol       `json:"protocol,omitempty"`
-	FailureThreshold          *int                                      `json:"failureThreshold,omitempty"`
-	AdditionalHeadersRef      *kuadrantdnsv1alpha1.AdditionalHeadersRef `json:"additionalHeadersRef,omitempty"`
-	ExpectedResponses         []int                                     `json:"expectedResponses,omitempty"`
-	AllowInsecureCertificates bool                                      `json:"allowInsecureCertificates,omitempty"`
-	Interval                  *metav1.Duration                          `json:"interval,omitempty"`
-}
-
-func (s *HealthCheckSpec) Validate() error {
-	if s.Interval != nil {
-		if s.Interval.Duration < (time.Second * 5) {
-			return fmt.Errorf("invalid value for spec.healthCheckSpec.interval %v, it cannot be shorter than 5s", s.Interval.Duration)
-		}
-	}
-
-	return nil
-}
-
-func (s *HealthCheckSpec) Default() {
-	if s.Interval == nil {
-		s.Interval = &metav1.Duration{
-			Duration: time.Second * 30,
-		}
-	}
-
-	if s.Protocol == nil {
-		protocol := kuadrantdnsv1alpha1.HttpsProtocol
-		s.Protocol = &protocol
-	}
+	// Endpoint is the path to append to the host to reach the expected health check.
+	// For example "/" or "/healthz" are common
+	// +kubebuilder:example:=/
+	Endpoint string `json:"endpoint"`
+	// Port to connect to the host on
+	// +kubebuilder:validation:Minimum:=1
+	Port int `json:"port"`
+	// Protocol to use when connecting to the host, valid values are "HTTP" or "HTTPS"
+	// +kubebuilder:validation:Enum:=HTTP;HTTPS
+	Protocol string `json:"protocol"`
+	// FailureThreshold is a limit of consecutive failures that must occur for a host
+	// to be considered unhealthy
+	// +kubebuilder:validation:Minimum:=1
+	FailureThreshold int `json:"failureThreshold"`
 }
 
 type HealthCheckStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-}
-
-type DNSRecordRef struct {
-	// +kubebuilder:validation:Required
-	// +required
-	Name string `json:"name"`
-	// +kubebuilder:validation:Required
-	// +required
-	Namespace string `json:"namespace"`
 }
 
 func init() {
@@ -269,6 +255,10 @@ func init() {
 
 func NewDNSPolicy(name, ns string) *DNSPolicy {
 	return &DNSPolicy{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "DNSPolicy",
+			APIVersion: GroupVersion.String(),
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: ns,
@@ -311,46 +301,25 @@ func (p *DNSPolicy) WithTargetGateway(gwName string) *DNSPolicy {
 
 //HealthCheck
 
-func (p *DNSPolicy) WithHealthCheckFor(endpoint string, port *int, protocol kuadrantdnsv1alpha1.HealthProtocol, failureThreshold *int) *DNSPolicy {
+func (p *DNSPolicy) WithHealthCheckFor(endpoint string, port int, protocol string, failureThreshold int) *DNSPolicy {
 	return p.WithHealthCheck(HealthCheckSpec{
-		Endpoint:                  endpoint,
-		Port:                      port,
-		Protocol:                  &protocol,
-		FailureThreshold:          failureThreshold,
-		AdditionalHeadersRef:      nil,
-		ExpectedResponses:         nil,
-		AllowInsecureCertificates: false,
-		Interval:                  nil,
+		Endpoint:         endpoint,
+		Port:             port,
+		Protocol:         protocol,
+		FailureThreshold: failureThreshold,
 	})
 }
 
 //LoadBalancing
 
-func (p *DNSPolicy) WithLoadBalancingWeighted(lbWeighted LoadBalancingWeighted) *DNSPolicy {
-	if p.Spec.LoadBalancing == nil {
-		p.WithLoadBalancing(LoadBalancingSpec{})
-	}
-	p.Spec.LoadBalancing.Weighted = &lbWeighted
-	return p
-}
-
-func (p *DNSPolicy) WithLoadBalancingGeo(lbGeo LoadBalancingGeo) *DNSPolicy {
-	if p.Spec.LoadBalancing == nil {
-		p.Spec.LoadBalancing = &LoadBalancingSpec{}
-	}
-	p.Spec.LoadBalancing.Geo = &lbGeo
-	return p
-}
-
-func (p *DNSPolicy) WithLoadBalancingWeightedFor(defaultWeight Weight, custom []*CustomWeight) *DNSPolicy {
-	return p.WithLoadBalancingWeighted(LoadBalancingWeighted{
-		DefaultWeight: defaultWeight,
-		Custom:        custom,
-	})
-}
-
-func (p *DNSPolicy) WithLoadBalancingGeoFor(defaultGeo string) *DNSPolicy {
-	return p.WithLoadBalancingGeo(LoadBalancingGeo{
-		DefaultGeo: defaultGeo,
+func (p *DNSPolicy) WithLoadBalancingFor(defaultWeight Weight, custom []*CustomWeight, defaultGeo string) *DNSPolicy {
+	return p.WithLoadBalancing(LoadBalancingSpec{
+		Weighted: LoadBalancingWeighted{
+			DefaultWeight: defaultWeight,
+			Custom:        custom,
+		},
+		Geo: LoadBalancingGeo{
+			DefaultGeo: defaultGeo,
+		},
 	})
 }

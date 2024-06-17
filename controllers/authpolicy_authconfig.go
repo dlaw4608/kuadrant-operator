@@ -5,9 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
-
-	"k8s.io/utils/ptr"
 
 	"github.com/go-logr/logr"
 	authorinoapi "github.com/kuadrant/authorino/api/v1beta2"
@@ -18,6 +17,7 @@ import (
 
 	api "github.com/kuadrant/kuadrant-operator/api/v1beta2"
 	"github.com/kuadrant/kuadrant-operator/pkg/common"
+	kuadrantgatewayapi "github.com/kuadrant/kuadrant-operator/pkg/library/gatewayapi"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/kuadrant"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/utils"
 )
@@ -56,7 +56,7 @@ func (r *AuthPolicyReconciler) desiredAuthConfig(ctx context.Context, ap *api.Au
 			APIVersion: authorinoapi.GroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      authConfigName(client.ObjectKeyFromObject(ap)),
+			Name:      AuthConfigName(client.ObjectKeyFromObject(ap)),
 			Namespace: ap.Namespace,
 		},
 		Spec: authorinoapi.AuthConfigSpec{},
@@ -67,14 +67,17 @@ func (r *AuthPolicyReconciler) desiredAuthConfig(ctx context.Context, ap *api.Au
 
 	switch obj := targetNetworkObject.(type) {
 	case *gatewayapiv1.HTTPRoute:
-		ok, err := routeGatewayHasAuthOverrides(ctx, obj, r.Client())
+		t, err := r.generateTopology(ctx)
 		if err != nil {
+			logger.V(1).Info("Failed to generate topology", "error", err)
 			return nil, err
 		}
-		if ok {
+
+		overrides := routeGatewayAuthOverrides(t, ap)
+		if len(overrides) != 0 {
 			logger.V(1).Info("targeted gateway has authpolicy with atomic overrides, skipping authorino authconfig for the HTTPRoute authpolicy")
 			utils.TagObjectToDelete(authConfig)
-			r.OverriddenPolicyMap.SetOverriddenPolicy(ap)
+			r.AffectedPolicyMap.SetAffectedPolicy(ap, overrides)
 			return authConfig, nil
 		}
 		route = obj
@@ -93,7 +96,7 @@ func (r *AuthPolicyReconciler) desiredAuthConfig(ctx context.Context, ap *api.Au
 		hosts = utils.HostnamesToStrings(gwHostnames)
 
 		rules := make([]gatewayapiv1.HTTPRouteRule, 0)
-		routes := r.TargetRefReconciler.FetchAcceptedGatewayHTTPRoutes(ctx, ap.TargetKey())
+		routes := r.TargetRefReconciler.FetchAcceptedGatewayHTTPRoutes(ctx, obj)
 		for idx := range routes {
 			route := routes[idx]
 			// skip routes that have an authpolicy of its own and Gateway authpolicy does not define atomic overrides
@@ -105,7 +108,14 @@ func (r *AuthPolicyReconciler) desiredAuthConfig(ctx context.Context, ap *api.Au
 		if len(rules) == 0 {
 			logger.V(1).Info("no httproutes attached to the targeted gateway, skipping authorino authconfig for the gateway authpolicy")
 			utils.TagObjectToDelete(authConfig)
-			r.OverriddenPolicyMap.SetOverriddenPolicy(ap)
+			obj := targetNetworkObject.(*gatewayapiv1.Gateway)
+			gatewayWrapper := kuadrant.GatewayWrapper{Gateway: obj, Referrer: ap}
+			refs := gatewayWrapper.PolicyRefs()
+			filteredRef := utils.Filter(refs, func(key client.ObjectKey) bool {
+				return key != client.ObjectKeyFromObject(ap)
+			})
+
+			r.AffectedPolicyMap.SetAffectedPolicy(ap, filteredRef)
 			return authConfig, nil
 		}
 		route = &gatewayapiv1.HTTPRoute{
@@ -116,8 +126,8 @@ func (r *AuthPolicyReconciler) desiredAuthConfig(ctx context.Context, ap *api.Au
 		}
 	}
 
-	// AuthPolicy is not overridden if we still need to create an AuthConfig for it
-	r.OverriddenPolicyMap.RemoveOverriddenPolicy(ap)
+	// AuthPolicy is not Affected if we still need to create an AuthConfig for it
+	r.AffectedPolicyMap.RemoveAffectedPolicy(ap)
 
 	// hosts
 	authConfig.Spec.Hosts = hosts
@@ -185,36 +195,48 @@ func (r *AuthPolicyReconciler) desiredAuthConfig(ctx context.Context, ap *api.Au
 	return mergeConditionsFromRouteSelectorsIntoConfigs(ap, route, authConfig)
 }
 
-// routeGatewayHasAuthOverrides return true when the gateway which a route is attached to has an attached authPolicy that defines atomic overrides
-func routeGatewayHasAuthOverrides(ctx context.Context, route *gatewayapiv1.HTTPRoute, c client.Client) (bool, error) {
-	for idx := range route.Spec.ParentRefs {
-		parentRef := route.Spec.ParentRefs[idx]
-		gw := &gatewayapiv1.Gateway{}
-		namespace := ptr.Deref(parentRef.Namespace, gatewayapiv1.Namespace(route.GetNamespace()))
-		err := c.Get(ctx, client.ObjectKey{Name: string(parentRef.Name), Namespace: string(namespace)}, gw)
-		if err != nil {
-			return false, err
-		}
+// routeGatewayAuthOverrides returns the GW auth policies that has an override field set
+func routeGatewayAuthOverrides(t *kuadrantgatewayapi.Topology, ap *api.AuthPolicy) []client.ObjectKey {
+	affectedPolicies := getAffectedPolicies(t, ap)
 
-		annotation, ok := gw.GetAnnotations()[common.AuthPolicyBackRefAnnotation]
-		if !ok {
-			continue
-		}
-		otherAP := &api.AuthPolicy{}
-		err = c.Get(ctx, utils.NamespacedNameToObjectKey(annotation, gw.Namespace), otherAP)
-		if err != nil {
-			return false, err
-		}
+	// Filter the policies where:
+	// 1. targets a gateway
+	// 2. is not the current AP that is being assessed
+	// 3. is an overriding policy
+	// 4. is not marked for deletion
+	affectedPolicies = utils.Filter(affectedPolicies, func(policy kuadrantgatewayapi.Policy) bool {
+		p, ok := policy.(*api.AuthPolicy)
+		return ok &&
+			p.DeletionTimestamp == nil &&
+			kuadrantgatewayapi.IsTargetRefGateway(policy.GetTargetRef()) &&
+			ap.GetUID() != policy.GetUID() &&
+			p.IsAtomicOverride()
+	})
 
-		if otherAP.IsAtomicOverride() {
-			return true, nil
-		}
-	}
-	return false, nil
+	return utils.Map(affectedPolicies, func(policy kuadrantgatewayapi.Policy) client.ObjectKey {
+		return client.ObjectKeyFromObject(policy)
+	})
 }
 
-// authConfigName returns the name of Authorino AuthConfig CR.
-func authConfigName(apKey client.ObjectKey) string {
+func getAffectedPolicies(t *kuadrantgatewayapi.Topology, ap *api.AuthPolicy) []kuadrantgatewayapi.Policy {
+	topologyIndexes := kuadrantgatewayapi.NewTopologyIndexes(t)
+	var affectedPolicies []kuadrantgatewayapi.Policy
+
+	// If AP is listed within the policies from gateway, it potentially can be overridden by it
+	for _, gw := range t.Gateways() {
+		policyList := topologyIndexes.PoliciesFromGateway(gw.Gateway)
+		if slices.Contains(utils.Map(policyList, func(p kuadrantgatewayapi.Policy) client.ObjectKey {
+			return client.ObjectKeyFromObject(p)
+		}), client.ObjectKeyFromObject(ap)) {
+			affectedPolicies = append(affectedPolicies, policyList...)
+		}
+	}
+
+	return affectedPolicies
+}
+
+// AuthConfigName returns the name of Authorino AuthConfig CR.
+func AuthConfigName(apKey client.ObjectKey) string {
 	return fmt.Sprintf("ap-%s-%s", apKey.Namespace, apKey.Name)
 }
 

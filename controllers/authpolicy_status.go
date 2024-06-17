@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -12,22 +11,24 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayapiv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
 	api "github.com/kuadrant/kuadrant-operator/api/v1beta2"
+	kuadrantgatewayapi "github.com/kuadrant/kuadrant-operator/pkg/library/gatewayapi"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/kuadrant"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/utils"
 )
 
 // reconcileStatus makes sure status block of AuthPolicy is up-to-date.
-func (r *AuthPolicyReconciler) reconcileStatus(ctx context.Context, ap *api.AuthPolicy, targetNetworkObject client.Object, specErr error) (ctrl.Result, error) {
+func (r *AuthPolicyReconciler) reconcileStatus(ctx context.Context, ap *api.AuthPolicy, specErr error) (ctrl.Result, error) {
 	logger, _ := logr.FromContext(ctx)
 	logger.V(1).Info("Reconciling AuthPolicy status", "spec error", specErr)
 
-	newStatus := r.calculateStatus(ctx, ap, targetNetworkObject, specErr)
+	newStatus := r.calculateStatus(ctx, ap, specErr)
 
 	equalStatus := ap.Status.Equals(newStatus, logger)
 	logger.V(1).Info("Status", "status is different", !equalStatus)
@@ -59,7 +60,7 @@ func (r *AuthPolicyReconciler) reconcileStatus(ctx context.Context, ap *api.Auth
 	return ctrl.Result{}, nil
 }
 
-func (r *AuthPolicyReconciler) calculateStatus(ctx context.Context, ap *api.AuthPolicy, targetNetworkObject client.Object, specErr error) *api.AuthPolicyStatus {
+func (r *AuthPolicyReconciler) calculateStatus(ctx context.Context, ap *api.AuthPolicy, specErr error) *api.AuthPolicyStatus {
 	newStatus := &api.AuthPolicyStatus{
 		Conditions:         slices.Clone(ap.Status.Conditions),
 		ObservedGeneration: ap.Status.ObservedGeneration,
@@ -70,10 +71,11 @@ func (r *AuthPolicyReconciler) calculateStatus(ctx context.Context, ap *api.Auth
 
 	// Do not set enforced condition if Accepted condition is false
 	if meta.IsStatusConditionFalse(newStatus.Conditions, string(gatewayapiv1alpha2.PolicyReasonAccepted)) {
+		meta.RemoveStatusCondition(&newStatus.Conditions, string(kuadrant.PolicyConditionEnforced))
 		return newStatus
 	}
 
-	enforcedCond := r.enforcedCondition(ctx, ap, targetNetworkObject)
+	enforcedCond := r.enforcedCondition(ctx, ap)
 	meta.SetStatusCondition(&newStatus.Conditions, *enforcedCond)
 
 	return newStatus
@@ -85,16 +87,16 @@ func (r *AuthPolicyReconciler) acceptedCondition(policy kuadrant.Policy, specErr
 
 // enforcedCondition checks if the provided AuthPolicy is enforced, ensuring it is properly configured and applied based
 // on the status of the associated AuthConfig and Gateway.
-func (r *AuthPolicyReconciler) enforcedCondition(ctx context.Context, policy *api.AuthPolicy, targetNetworkObject client.Object) *metav1.Condition {
+func (r *AuthPolicyReconciler) enforcedCondition(ctx context.Context, policy *api.AuthPolicy) *metav1.Condition {
 	logger, _ := logr.FromContext(ctx)
 
-	// Check if the policy is overridden
+	// Check if the policy is Affected
 	// Note: This logic assumes synchronous processing, where computing the desired AuthConfig, marking the AuthPolicy
-	// as overridden, and calculating the Enforced condition happen sequentially.
+	// as Affected, and calculating the Enforced condition happen sequentially.
 	// Introducing a goroutine in this flow could break this assumption and lead to unexpected behavior.
-	if r.OverriddenPolicyMap.IsPolicyOverridden(policy) {
+	if r.AffectedPolicyMap.IsPolicyAffected(policy) {
 		logger.V(1).Info("Gateway Policy is overridden")
-		return r.handleGatewayPolicyOverride(logger, policy, targetNetworkObject)
+		return r.handlePolicyOverride(policy)
 	}
 
 	// Check if the AuthConfig is ready
@@ -118,7 +120,7 @@ func (r *AuthPolicyReconciler) isAuthConfigReady(ctx context.Context, policy *ap
 	apKey := client.ObjectKeyFromObject(policy)
 	authConfigKey := client.ObjectKey{
 		Namespace: policy.Namespace,
-		Name:      authConfigName(apKey),
+		Name:      AuthConfigName(apKey),
 	}
 	authConfig := &authorinoapi.AuthConfig{}
 	err := r.GetResource(ctx, authConfigKey, authConfig)
@@ -130,19 +132,46 @@ func (r *AuthPolicyReconciler) isAuthConfigReady(ctx context.Context, policy *ap
 	return authConfig.Status.Ready(), nil
 }
 
-// handleGatewayPolicyOverride handles the case where the Gateway Policy is overridden by filtering policy references
-// and creating a corresponding error condition.
-func (r *AuthPolicyReconciler) handleGatewayPolicyOverride(logger logr.Logger, policy *api.AuthPolicy, targetNetworkObject client.Object) *metav1.Condition {
-	obj := targetNetworkObject.(*gatewayapiv1.Gateway)
-	gatewayWrapper := kuadrant.GatewayWrapper{Gateway: obj, Referrer: policy}
-	refs := gatewayWrapper.PolicyRefs()
-	filteredRef := utils.Filter(refs, func(key client.ObjectKey) bool {
-		return key != client.ObjectKeyFromObject(policy)
-	})
-	jsonData, err := json.Marshal(filteredRef)
-	if err != nil {
-		logger.Error(err, "Failed to marshal filtered references")
-		return kuadrant.EnforcedCondition(policy, kuadrant.NewErrUnknown(policy.Kind(), err), false)
+func (r *AuthPolicyReconciler) handlePolicyOverride(policy *api.AuthPolicy) *metav1.Condition {
+	if !r.AffectedPolicyMap.IsPolicyOverridden(policy) {
+		return kuadrant.EnforcedCondition(policy, kuadrant.NewErrUnknown(policy.Kind(), errors.New("no free routes to enforce policy")), false) // Maybe this should be a standard condition rather than an unknown condition
 	}
-	return kuadrant.EnforcedCondition(policy, kuadrant.NewErrOverridden(policy.Kind(), string(jsonData)), false)
+
+	return kuadrant.EnforcedCondition(policy, kuadrant.NewErrOverridden(policy.Kind(), r.AffectedPolicyMap.PolicyAffectedBy(policy)), false)
+}
+
+func (r *AuthPolicyReconciler) generateTopology(ctx context.Context) (*kuadrantgatewayapi.Topology, error) {
+	logger, _ := logr.FromContext(ctx)
+
+	gwList := &gatewayapiv1.GatewayList{}
+	err := r.Client().List(ctx, gwList)
+	logger.V(1).Info("topology: list gateways", "#Gateways", len(gwList.Items), "err", err)
+	if err != nil {
+		return nil, err
+	}
+
+	routeList := &gatewayapiv1.HTTPRouteList{}
+	err = r.Client().List(ctx, routeList)
+	logger.V(1).Info("topology: list httproutes", "#HTTPRoutes", len(routeList.Items), "err", err)
+	if err != nil {
+		return nil, err
+	}
+
+	aplist := &api.AuthPolicyList{}
+	err = r.Client().List(ctx, aplist)
+	logger.V(1).Info("topology: list rate limit policies", "#RLPS", len(aplist.Items), "err", err)
+	if err != nil {
+		return nil, err
+	}
+
+	policies := utils.Map(aplist.Items, func(p api.AuthPolicy) kuadrantgatewayapi.Policy {
+		return &p
+	})
+
+	return kuadrantgatewayapi.NewTopology(
+		kuadrantgatewayapi.WithGateways(utils.Map(gwList.Items, ptr.To[gatewayapiv1.Gateway])),
+		kuadrantgatewayapi.WithRoutes(utils.Map(routeList.Items, ptr.To[gatewayapiv1.HTTPRoute])),
+		kuadrantgatewayapi.WithPolicies(policies),
+		kuadrantgatewayapi.WithLogger(logger),
+	)
 }

@@ -22,7 +22,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayapiv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
@@ -122,6 +121,9 @@ func (l Limit) CountersAsStringList() []string {
 // RateLimitPolicySpec defines the desired state of RateLimitPolicy
 // +kubebuilder:validation:XValidation:rule="self.targetRef.kind != 'Gateway' || !has(self.limits) || !self.limits.exists(x, has(self.limits[x].routeSelectors))",message="route selectors not supported when targeting a Gateway"
 // +kubebuilder:validation:XValidation:rule="!(has(self.defaults) && has(self.limits))",message="Implicit and explicit defaults are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="!(has(self.defaults) && has(self.overrides))",message="Overrides and explicit defaults are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="!(has(self.overrides) && has(self.limits))",message="Overrides and implicit defaults are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="!(has(self.overrides) && self.targetRef.kind != 'Gateway')",message="Overrides are only allowed for policies targeting a Gateway resource"
 type RateLimitPolicySpec struct {
 	// TargetRef identifies an API object to apply policy to.
 	// +kubebuilder:validation:XValidation:rule="self.group == 'gateway.networking.k8s.io'",message="Invalid targetRef.group. The only supported value is 'gateway.networking.k8s.io'"
@@ -132,6 +134,11 @@ type RateLimitPolicySpec struct {
 	// Defaults are mutually exclusive with implicit defaults defined by RateLimitPolicyCommonSpec.
 	// +optional
 	Defaults *RateLimitPolicyCommonSpec `json:"defaults,omitempty"`
+
+	// Overrides define override values for this policy and for policies inheriting this policy.
+	// Overrides are mutually exclusive with implicit defaults and explicit Defaults defined by RateLimitPolicyCommonSpec.
+	// +optional
+	Overrides *RateLimitPolicyCommonSpec `json:"overrides,omitempty"`
 
 	// RateLimitPolicyCommonSpec defines implicit default values for this policy and for policies inheriting this policy.
 	// RateLimitPolicyCommonSpec is mutually exclusive with explicit defaults defined by Defaults.
@@ -182,6 +189,10 @@ func (s *RateLimitPolicyStatus) Equals(other *RateLimitPolicyStatus, logger logr
 	return true
 }
 
+func (s *RateLimitPolicyStatus) GetConditions() []metav1.Condition {
+	return s.Conditions
+}
+
 var _ kuadrant.Policy = &RateLimitPolicy{}
 var _ kuadrant.Referrer = &RateLimitPolicy{}
 
@@ -213,18 +224,6 @@ func (r *RateLimitPolicy) Validate() error {
 	return nil
 }
 
-func (r *RateLimitPolicy) TargetKey() client.ObjectKey {
-	tmpNS := r.Namespace
-	if r.Spec.TargetRef.Namespace != nil {
-		tmpNS = string(*r.Spec.TargetRef.Namespace)
-	}
-
-	return client.ObjectKey{
-		Name:      string(r.Spec.TargetRef.Name),
-		Namespace: tmpNS,
-	}
-}
-
 //+kubebuilder:object:root=true
 
 // RateLimitPolicyList contains a list of RateLimitPolicy
@@ -242,6 +241,10 @@ func (l *RateLimitPolicyList) GetItems() []kuadrant.Policy {
 
 func (r *RateLimitPolicy) GetTargetRef() gatewayapiv1alpha2.PolicyTargetReference {
 	return r.Spec.TargetRef
+}
+
+func (r *RateLimitPolicy) GetStatus() kuadrantgatewayapi.PolicyStatus {
+	return &r.Status
 }
 
 func (r *RateLimitPolicy) GetWrappedNamespace() gatewayapiv1.Namespace {
@@ -269,6 +272,10 @@ func (r *RateLimitPolicy) Kind() string {
 	return r.TypeMeta.Kind
 }
 
+func (r *RateLimitPolicy) PolicyClass() kuadrantgatewayapi.PolicyClass {
+	return kuadrantgatewayapi.InheritedPolicy
+}
+
 func (r *RateLimitPolicy) BackReferenceAnnotationName() string {
 	return RateLimitPolicyBackReferenceAnnotationName
 }
@@ -284,6 +291,10 @@ func (r *RateLimitPolicy) DirectReferenceAnnotationName() string {
 func (r *RateLimitPolicySpec) CommonSpec() *RateLimitPolicyCommonSpec {
 	if r.Defaults != nil {
 		return r.Defaults
+	}
+
+	if r.Overrides != nil {
+		return r.Overrides
 	}
 
 	return &r.RateLimitPolicyCommonSpec

@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/go-logr/logr"
 	authorinoapi "github.com/kuadrant/authorino/api/v1beta2"
@@ -15,6 +16,7 @@ import (
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	api "github.com/kuadrant/kuadrant-operator/api/v1beta2"
+	kuadrantgatewayapi "github.com/kuadrant/kuadrant-operator/pkg/library/gatewayapi"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/kuadrant"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/mappers"
 	"github.com/kuadrant/kuadrant-operator/pkg/library/reconcilers"
@@ -26,8 +28,8 @@ const authPolicyFinalizer = "authpolicy.kuadrant.io/finalizer"
 type AuthPolicyReconciler struct {
 	*reconcilers.BaseReconciler
 	TargetRefReconciler reconcilers.TargetRefReconciler
-	// OverriddenPolicyMap tracks the overridden policies to report their status.
-	OverriddenPolicyMap *kuadrant.OverriddenPolicyMap
+	// AffectedPolicyMap tracks the affected policies to report their status.
+	AffectedPolicyMap *kuadrant.AffectedPolicyMap
 }
 
 //+kubebuilder:rbac:groups=kuadrant.io,resources=authpolicies,verbs=get;list;watch;create;update;patch;delete
@@ -72,7 +74,7 @@ func (r *AuthPolicyReconciler) Reconcile(eventCtx context.Context, req ctrl.Requ
 				if delResErr == nil {
 					delResErr = err
 				}
-				return r.reconcileStatus(ctx, ap, targetNetworkObject, kuadrant.NewErrTargetNotFound(ap.Kind(), ap.GetTargetRef(), delResErr))
+				return r.reconcileStatus(ctx, ap, kuadrant.NewErrTargetNotFound(ap.Kind(), ap.GetTargetRef(), delResErr))
 			}
 			return ctrl.Result{}, err
 		}
@@ -108,7 +110,7 @@ func (r *AuthPolicyReconciler) Reconcile(eventCtx context.Context, req ctrl.Requ
 	specErr := r.reconcileResources(ctx, ap, targetNetworkObject)
 
 	// reconcile authpolicy status
-	statusResult, statusErr := r.reconcileStatus(ctx, ap, targetNetworkObject, specErr)
+	statusResult, statusErr := r.reconcileStatus(ctx, ap, specErr)
 
 	if specErr != nil {
 		return ctrl.Result{}, specErr
@@ -160,11 +162,11 @@ func (r *AuthPolicyReconciler) reconcileResources(ctx context.Context, ap *api.A
 	}
 
 	if err := r.reconcileIstioAuthorizationPolicies(ctx, ap, targetNetworkObject, gatewayDiffObj); err != nil {
-		return err
+		return fmt.Errorf("reconcile AuthorizationPolicy error %w", err)
 	}
 
 	if err := r.reconcileAuthConfigs(ctx, ap, targetNetworkObject); err != nil {
-		return err
+		return fmt.Errorf("reconcile AuthConfig error %w", err)
 	}
 
 	// if the AuthPolicy(ap) targets a Gateway then all policies attached to that Gateway need to be checked.
@@ -184,8 +186,7 @@ func (r *AuthPolicyReconciler) reconcileResources(ctx context.Context, ap *api.A
 				return err
 			}
 
-			refNetworkObject := &gatewayapiv1.HTTPRoute{}
-			err = r.Client().Get(ctx, ref.TargetKey(), refNetworkObject)
+			refNetworkObject, err := reconcilers.FetchTargetRefObject(ctx, r.Client(), ref.GetTargetRef(), ref.Namespace)
 			if err != nil {
 				return err
 			}
@@ -198,11 +199,15 @@ func (r *AuthPolicyReconciler) reconcileResources(ctx context.Context, ap *api.A
 
 	// set direct back ref - i.e. claim the target network object as taken asap
 	if err := r.reconcileNetworkResourceDirectBackReference(ctx, ap, targetNetworkObject); err != nil {
-		return err
+		return fmt.Errorf("reconcile TargetBackReference error %w", err)
 	}
 
 	// set annotation of policies affecting the gateway - should be the last step, only when all the reconciliation steps succeed
-	return r.TargetRefReconciler.ReconcileGatewayPolicyReferences(ctx, ap, gatewayDiffObj)
+	if err := r.TargetRefReconciler.ReconcileGatewayPolicyReferences(ctx, ap, gatewayDiffObj); err != nil {
+		return fmt.Errorf("ReconcileGatewayPolicyReferences error %w", err)
+	}
+
+	return nil
 }
 
 func (r *AuthPolicyReconciler) deleteResources(ctx context.Context, ap *api.AuthPolicy, targetNetworkObject client.Object) error {
@@ -256,6 +261,15 @@ func (r *AuthPolicyReconciler) reconcileRouteParentGatewayPolicies(ctx context.C
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AuthPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	ok, err := kuadrantgatewayapi.IsGatewayAPIInstalled(mgr.GetRESTMapper())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		r.Logger().Info("AuthPolicy controller disabled. GatewayAPI was not found")
+		return nil
+	}
+
 	httpRouteEventMapper := mappers.NewHTTPRouteEventMapper(mappers.WithLogger(r.Logger().WithName("httpRouteEventMapper")))
 	gatewayEventMapper := mappers.NewGatewayEventMapper(mappers.WithLogger(r.Logger().WithName("gatewayEventMapper")))
 

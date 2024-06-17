@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -79,6 +81,8 @@ func GetGatewayWorkloadSelector(ctx context.Context, cli client.Client, gateway 
 	return utils.GetServiceWorkloadSelector(ctx, cli, serviceKey)
 }
 
+// IsHTTPRouteAccepted returns true if a given HTTPRoute has the Accepted status condition added by any of its
+// parentRefs; otherwise, it returns false
 func IsHTTPRouteAccepted(httpRoute *gatewayapiv1.HTTPRoute) bool {
 	acceptedParentRefs := GetRouteAcceptedParentRefs(httpRoute)
 
@@ -89,28 +93,17 @@ func IsHTTPRouteAccepted(httpRoute *gatewayapiv1.HTTPRoute) bool {
 	return len(acceptedParentRefs) == len(httpRoute.Spec.ParentRefs)
 }
 
-func IsParentGateway(ref gatewayapiv1.ParentReference) bool {
-	return (ref.Kind == nil || *ref.Kind == "Gateway") && (ref.Group == nil || *ref.Group == gatewayapiv1.GroupName)
+func IsPolicyAccepted(policy Policy) bool {
+	condition := meta.FindStatusCondition(policy.GetStatus().GetConditions(), string(gatewayapiv1alpha2.PolicyConditionAccepted))
+	return condition != nil && condition.Status == metav1.ConditionTrue
 }
 
-func GetRouteAcceptedParentRefs(route *gatewayapiv1.HTTPRoute) []gatewayapiv1.ParentReference {
-	if route == nil {
-		return nil
-	}
-
-	return utils.Filter(route.Spec.ParentRefs, func(p gatewayapiv1.ParentReference) bool {
-		parentStatus, found := utils.Find(route.Status.RouteStatus.Parents, func(pStatus gatewayapiv1.RouteParentStatus) bool {
-			return reflect.DeepEqual(pStatus.ParentRef, p)
-		})
-
-		if !found {
-			return false
-		}
-
-		return meta.IsStatusConditionTrue(parentStatus.Conditions, "Accepted")
-	})
+func IsNotPolicyAccepted(policy Policy) bool {
+	condition := meta.FindStatusCondition(policy.GetStatus().GetConditions(), string(gatewayapiv1alpha2.PolicyConditionAccepted))
+	return condition == nil || condition.Status != metav1.ConditionTrue
 }
 
+// GetRouteAcceptedGatewayParentKeys returns the object keys of all gateways that have accepted a given route
 func GetRouteAcceptedGatewayParentKeys(route *gatewayapiv1.HTTPRoute) []client.ObjectKey {
 	acceptedParentRefs := GetRouteAcceptedParentRefs(route)
 
@@ -124,6 +117,26 @@ func GetRouteAcceptedGatewayParentKeys(route *gatewayapiv1.HTTPRoute) []client.O
 	})
 }
 
+// GetRouteAcceptedParentRefs returns the list of parentRefs for which a given route has the Accepted status condition
+func GetRouteAcceptedParentRefs(route *gatewayapiv1.HTTPRoute) []gatewayapiv1.ParentReference {
+	if route == nil {
+		return nil
+	}
+
+	return utils.Filter(route.Spec.ParentRefs, func(p gatewayapiv1.ParentReference) bool {
+		for _, parentStatus := range route.Status.RouteStatus.Parents {
+			if reflect.DeepEqual(parentStatus.ParentRef, p) && meta.IsStatusConditionTrue(parentStatus.Conditions, string(gatewayapiv1.RouteConditionAccepted)) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func IsParentGateway(ref gatewayapiv1.ParentReference) bool {
+	return (ref.Kind == nil || *ref.Kind == "Gateway") && (ref.Group == nil || *ref.Group == gatewayapiv1.GroupName)
+}
+
 // FilterValidSubdomains returns every subdomain that is a subset of at least one of the (super) domains specified in the first argument.
 func FilterValidSubdomains(domains, subdomains []gatewayapiv1.Hostname) []gatewayapiv1.Hostname {
 	arr := make([]gatewayapiv1.Hostname, 0)
@@ -135,4 +148,20 @@ func FilterValidSubdomains(domains, subdomains []gatewayapiv1.Hostname) []gatewa
 		}
 	}
 	return arr
+}
+
+func IsGatewayAPIInstalled(restMapper meta.RESTMapper) (bool, error) {
+	_, err := restMapper.RESTMapping(
+		schema.GroupKind{Group: gatewayapiv1.GroupName, Kind: "HTTPRoute"},
+		gatewayapiv1.SchemeGroupVersion.Version,
+	)
+	if err == nil {
+		return true, nil
+	}
+
+	if meta.IsNoMatchError(err) {
+		return false, nil
+	}
+
+	return false, err
 }

@@ -10,16 +10,17 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	gatewayapiv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
 	authorinov1beta1 "github.com/kuadrant/authorino-operator/api/v1beta1"
+	limitadorv1alpha1 "github.com/kuadrant/limitador-operator/api/v1alpha1"
+
 	kuadrantv1beta1 "github.com/kuadrant/kuadrant-operator/api/v1beta1"
 	"github.com/kuadrant/kuadrant-operator/pkg/common"
-	limitadorv1alpha1 "github.com/kuadrant/limitador-operator/api/v1alpha1"
+	kuadrantistioutils "github.com/kuadrant/kuadrant-operator/pkg/istio"
 )
 
 const (
@@ -98,7 +99,18 @@ func (r *KuadrantReconciler) readyCondition(ctx context.Context, kObj *kuadrantv
 		return cond, nil
 	}
 
-	reason, err := r.checkLimitadorReady(ctx, kObj)
+	reason, err := r.checkGatewayProviders()
+	if err != nil {
+		return nil, err
+	}
+	if reason != nil {
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = "GatewayAPIPRoviderNotFound"
+		cond.Message = *reason
+		return cond, nil
+	}
+
+	reason, err = r.checkLimitadorReady(ctx, kObj)
 	if err != nil {
 		return nil, err
 	}
@@ -175,28 +187,31 @@ func (r *KuadrantReconciler) checkAuthorinoAvailable(ctx context.Context, kObj *
 	return nil, nil
 }
 
-func BuildPolicyAffectedCondition(conditionType string, policyObject runtime.Object, targetRef metav1.Object, reason gatewayapiv1alpha2.PolicyConditionReason, err error) metav1.Condition {
-	condition := metav1.Condition{
-		Type:               conditionType,
-		Status:             metav1.ConditionTrue,
-		Reason:             string(reason),
-		ObservedGeneration: targetRef.GetGeneration(),
+func (r *KuadrantReconciler) checkGatewayProviders() (*string, error) {
+	anyProviderFunc := func(checks []func(restMapper meta.RESTMapper) (bool, error)) (bool, error) {
+		for _, check := range checks {
+			ok, err := check(r.RestMapper)
+			if err != nil {
+				return false, err
+			}
+			if ok {
+				return true, nil
+			}
+		}
+		return false, nil
 	}
 
-	objectMeta, metaErr := meta.Accessor(policyObject)
-	if metaErr != nil {
-		condition.Status = metav1.ConditionFalse
-		condition.Message = fmt.Sprintf("failed to get metadata about policy object %s", policyObject.GetObjectKind().GroupVersionKind().String())
-		condition.Reason = PolicyReasonUnknown
-		return condition
-	}
+	anyProvider, err := anyProviderFunc([]func(restMapper meta.RESTMapper) (bool, error){
+		kuadrantistioutils.IsIstioInstalled,
+	})
+
 	if err != nil {
-		condition.Status = metav1.ConditionFalse
-		condition.Message = fmt.Sprintf("policy failed. Object unaffected by policy %s in namespace %s with name %s with error %s", policyObject.GetObjectKind().GroupVersionKind().String(), objectMeta.GetNamespace(), objectMeta.GetName(), err)
-		return condition
+		return nil, err
 	}
 
-	condition.Message = fmt.Sprintf("policy success. Object affected by policy %s in namespace %s with name %s ", policyObject.GetObjectKind().GroupVersionKind().String(), objectMeta.GetNamespace(), objectMeta.GetName())
+	if anyProvider {
+		return nil, nil
+	}
 
-	return condition
+	return ptr.To("GatewayAPI provider not found"), nil
 }
