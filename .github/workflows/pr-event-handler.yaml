@@ -1,0 +1,41 @@
+name: PR Event Handler
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  handle-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check for Trigger Label
+        id: check_trigger
+        run: |
+          LABEL_TRIGGERED=false
+          if [[ "${{ github.event.action }}" == "labeled" ]]; then
+            if [[ "${{ github.event.label.name }}" == "ok-to-build" ]]; then
+              LABEL_TRIGGERED=true
+            fi
+          elif [[ "${{ github.event.action }}" == "opened" || "${{ github.event.action }}" == "synchronize" || "${{ github.event.action }}" == "reopened" ]]; then
+            labels=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "${{ github.event.pull_request.issue_url }}/labels")
+            if echo "$labels" | jq -e '.[].name | contains("ok-to-build")' > /dev/null; then
+              LABEL_TRIGGERED=true
+            fi
+          fi
+          echo "LABEL_TRIGGERED=$LABEL_TRIGGERED" >> $GITHUB_ENV
+
+      - name: Trigger Build
+        if: env.LABEL_TRIGGERED == 'true'
+        uses: ./.github/workflows/build-images-base.yaml
+        with:
+          kuadrantOperatorTag: ${{ github.event.pull_request.head.ref }}
+          kuadrantOperatorVersion: ${{ github.event.pull_request.head.sha }}
+          authorinoOperatorVersion: 'latest'
+          limitadorOperatorVersion: 'latest'
+          dnsOperatorVersion: 'latest'
+          wasmShimVersion: 'latest'
