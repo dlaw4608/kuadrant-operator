@@ -6,9 +6,9 @@ on:
 
 jobs:
   workflow-build:
-    if: ${{ github.event_name == 'pull_request_target' && contains(github.event.pull_request.labels.*.name, 'forked_image_approved') }}
-    name: Calls build-images-crosscompiler workflow
-    uses: ./.github/workflows/build-images-crosscompiler.yaml
+    if: contains(github.event.pull_request.labels.*.name, 'forked_image_approved') 
+    name: Calls build-images-base
+    uses: ./.github/workflows/build-images-base.yaml
     secrets: inherit
     with:
       kuadrantOperatorVersion: ${{ github.event.pull_request.user.login }}-${{ github.event.pull_request.number }}
