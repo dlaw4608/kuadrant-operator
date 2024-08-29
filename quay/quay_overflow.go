@@ -9,10 +9,12 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"k8s.io/client-go/rest"
 )
 
 const (
-	repo    = "test_org_123/kuadrant-operator"
+	repo    = "kuadrant/kuadrant-operator"
 	baseURL = "https://quay.io/api/v1/repository/"
 )
 
@@ -20,7 +22,7 @@ var (
 	robotPass         = os.Getenv("ROBOT_PASS")
 	robotUser         = os.Getenv("ROBOT_USER")
 	accessToken       = os.Getenv("ACCESS_TOKEN")
-	preserveSubstring = "danlaw345" // Example Tag name that wont be deleted i.e relevant tags
+	preserveSubstring = "latest" // Example Tag name that wont be deleted i.e relevant tags
 )
 
 // Tag represents a tag in the repository.
@@ -62,7 +64,9 @@ func main() {
 }
 
 // fetchTags retrieves the tags from the repository using the Quay.io API.
-func fetchTags(client *http.Client) ([]Tag, error) {
+func fetchTags(client rest.HTTPClient) ([]Tag, error) {
+	// TODO - DO you want to seperate out builidng the request to a function to unit test?
+	// TODO - Is adding the headers even needed to fetch tags for a public repo?
 	req, err := http.NewRequest("GET", baseURL+repo+"/tag", nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
@@ -138,7 +142,7 @@ func containsSubstring(tagName, substring string) bool {
 
 // deleteTag sends a DELETE request to remove the specified tag from the repository
 // Returns true if successful, false otherwise
-func deleteTag(client *http.Client, accessToken, tagName string) bool {
+func deleteTag(client rest.HTTPClient, accessToken, tagName string) bool {
 	req, err := http.NewRequest("DELETE", baseURL+repo+"/tag/"+tagName, nil)
 	if err != nil {
 		fmt.Println("Error creating DELETE request:", err)
